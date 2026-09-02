@@ -12,8 +12,10 @@ import { mainWindow } from '../../../../base/browser/window.js';
 import { ActivityBarPosition, IWorkbenchLayoutService, LayoutSettings, Parts, Position, FLOATING_PANEL_INNER_MARGIN, FLOATING_PANEL_MARGIN, getFloatingPanelMargin, getFloatingPanelOuterMargin, isFloatingTopEdgeExposed } from '../../../services/layout/browser/layoutService.js';
 import { IInstantiationService, ServicesAccessor } from '../../../../platform/instantiation/common/instantiation.js';
 import { DisposableStore, MutableDisposable } from '../../../../base/common/lifecycle.js';
+import { Color } from '../../../../base/common/color.js';
 import { ToggleSidebarPositionAction, ToggleSidebarVisibilityAction } from '../../actions/layoutActions.js';
 import { IThemeService, IColorTheme, registerThemingParticipant } from '../../../../platform/theme/common/themeService.js';
+import { isHighContrast } from '../../../../platform/theme/common/theme.js';
 import { ACTIVITY_BAR_BACKGROUND, ACTIVITY_BAR_BORDER, ACTIVITY_BAR_FOREGROUND, ACTIVITY_BAR_ACTIVE_BORDER, ACTIVITY_BAR_BADGE_BACKGROUND, ACTIVITY_BAR_BADGE_FOREGROUND, ACTIVITY_BAR_INACTIVE_FOREGROUND, ACTIVITY_BAR_ACTIVE_BACKGROUND, ACTIVITY_BAR_DRAG_AND_DROP_BORDER, ACTIVITY_BAR_ACTIVE_FOCUS_BORDER, MODERN_ACTIVITY_BAR_BACKGROUND, MODERN_ACTIVITY_BAR_INACTIVE_BACKGROUND } from '../../../common/theme.js';
 import { activeContrastBorder, contrastBorder, focusBorder } from '../../../../platform/theme/common/colorRegistry.js';
 import { addDisposableListener, append, EventType, isAncestor, $, clearNode } from '../../../../base/browser/dom.js';
@@ -41,6 +43,21 @@ import { IWorkbenchEnvironmentService } from '../../../services/environment/comm
 import { IViewsService } from '../../../services/views/common/viewsService.js';
 import { SwitchCompositeViewAction } from '../compositeBarActions.js';
 import { IHostService } from '../../../services/host/browser/host.js';
+import { IWorkbenchAssignmentService } from '../../../services/assignment/common/assignmentService.js';
+import { ILogService } from '../../../../platform/log/common/log.js';
+
+export const ACTIVITY_BAR_COLOR_TREATMENT = 'workbench.activityBar.colorTreatment';
+
+const ACTIVITY_BAR_COLOR_TREATMENT_DARK_ACCENT = Color.fromHex('#3B0764');
+const ACTIVITY_BAR_COLOR_TREATMENT_DARK_INACTIVE_ACCENT = Color.fromHex('#2E1065');
+const ACTIVITY_BAR_COLOR_TREATMENT_LIGHT_ACCENT = Color.fromHex('#E9E1F7');
+const ACTIVITY_BAR_COLOR_TREATMENT_LIGHT_INACTIVE_ACCENT = Color.fromHex('#F1ECFA');
+const ACTIVITY_BAR_COLOR_TREATMENT_MINIMUM_CONTRAST = 3;
+
+const enum ActivityBarColorTreatment {
+	Control,
+	Accent,
+}
 
 export class ActivitybarPart extends Part {
 
@@ -177,16 +194,22 @@ export class ActivitybarPart extends Part {
 	private content: HTMLElement | undefined;
 	private _isCompact: boolean;
 	private isInactive: boolean;
+	private colorTreatment = ActivityBarColorTreatment.Control;
+	private colorTreatmentRequested = false;
+	private colorTreatmentRequest: Promise<void> | undefined;
+	private colorTreatmentRefetchPending = false;
 
 	constructor(
 		private readonly location: ViewContainerLocation,
 		private readonly paneCompositePart: IPaneCompositePart,
 		@IInstantiationService private readonly instantiationService: IInstantiationService,
 		@IWorkbenchLayoutService layoutService: IWorkbenchLayoutService,
-		@IThemeService themeService: IThemeService,
+		@IThemeService protected override readonly themeService: IThemeService,
 		@IStorageService storageService: IStorageService,
 		@IConfigurationService private readonly configurationService: IConfigurationService,
 		@IHostService private readonly hostService: IHostService,
+		@IWorkbenchAssignmentService private readonly assignmentService: IWorkbenchAssignmentService,
+		@ILogService private readonly logService: ILogService,
 	) {
 		super(Parts.ACTIVITYBAR_PART, { hasTitle: false }, themeService, storageService, layoutService);
 
@@ -215,6 +238,11 @@ export class ActivitybarPart extends Part {
 
 		this._register(this.hostService.onDidChangeFocus(focused => this.setInactive(!focused)));
 		this._register(this.hostService.onDidChangeActiveWindow(windowId => this.setInactive(windowId !== mainWindow.vscodeWindowId)));
+		this._register(this.assignmentService.onDidRefetchAssignments(() => {
+			if (this.colorTreatment === ActivityBarColorTreatment.Accent) {
+				this.requestColorTreatment(false);
+			}
+		}));
 
 		// Showing or hiding the primary side bar decides whether the rail connects to it or
 		// stands alone, which can change the gutter it reserves (see `needsFloatingLeadingGap`).
@@ -329,11 +357,17 @@ export class ActivitybarPart extends Part {
 		super.updateStyles();
 
 		const container = assertReturnsDefined(this.getContainer());
-		let backgroundColor = ACTIVITY_BAR_BACKGROUND;
-		if (this.configurationService.getValue<boolean>(LayoutSettings.MODERN_UI) === true) {
-			backgroundColor = this.isInactive ? MODERN_ACTIVITY_BAR_INACTIVE_BACKGROUND : MODERN_ACTIVITY_BAR_BACKGROUND;
+		const modernUI = this.configurationService.getValue<boolean>(LayoutSettings.MODERN_UI) === true;
+		const treatmentBackground = this.getColorTreatmentBackground(this.themeService.getColorTheme(), modernUI && this.isInactive);
+		let background: string;
+		if (treatmentBackground) {
+			background = treatmentBackground.toString();
+		} else {
+			const backgroundColor = modernUI
+				? this.isInactive ? MODERN_ACTIVITY_BAR_INACTIVE_BACKGROUND : MODERN_ACTIVITY_BAR_BACKGROUND
+				: ACTIVITY_BAR_BACKGROUND;
+			background = this.getColor(backgroundColor) || '';
 		}
-		const background = this.getColor(backgroundColor) || '';
 		container.style.backgroundColor = background;
 
 		// In Modern UI the rail is a floating card whose border is owned by the stylesheet via
@@ -346,10 +380,41 @@ export class ActivitybarPart extends Part {
 		container.style.borderColor = borderColor;
 	}
 
+	private getColorTreatmentBackground(theme: IColorTheme, inactive: boolean): Color | undefined {
+		if (this.colorTreatment !== ActivityBarColorTreatment.Accent || isHighContrast(theme.type)) {
+			return undefined;
+		}
+
+		const foregrounds = [
+			theme.getColor(ACTIVITY_BAR_FOREGROUND),
+			theme.getColor(ACTIVITY_BAR_INACTIVE_FOREGROUND),
+		].filter((color): color is Color => color !== undefined);
+		const candidates = inactive
+			? [ACTIVITY_BAR_COLOR_TREATMENT_DARK_INACTIVE_ACCENT, ACTIVITY_BAR_COLOR_TREATMENT_LIGHT_INACTIVE_ACCENT]
+			: [ACTIVITY_BAR_COLOR_TREATMENT_DARK_ACCENT, ACTIVITY_BAR_COLOR_TREATMENT_LIGHT_ACCENT];
+		if (foregrounds.length === 0) {
+			return candidates[0];
+		}
+
+		let bestCandidate: Color | undefined;
+		let bestContrast = 0;
+		for (const candidate of candidates) {
+			const contrast = Math.min(...foregrounds.map(foreground => candidate.getContrastRatio(foreground.makeOpaque(candidate))));
+			if (contrast > bestContrast) {
+				bestCandidate = candidate;
+				bestContrast = contrast;
+			}
+		}
+
+		return bestContrast >= ACTIVITY_BAR_COLOR_TREATMENT_MINIMUM_CONTRAST ? bestCandidate : undefined;
+	}
+
 	show(focus?: boolean): void {
 		if (!this.content) {
 			return;
 		}
+
+		this.requestColorTreatment(true);
 
 		if (!this.compositeBar.value) {
 			this.compositeBar.value = this.createCompositeBar();
@@ -362,6 +427,53 @@ export class ActivitybarPart extends Part {
 
 		if (focus) {
 			this.focus();
+		}
+	}
+
+	private requestColorTreatment(allowEnrollment: boolean): void {
+		if (this.colorTreatmentRequest) {
+			if (!allowEnrollment) {
+				this.colorTreatmentRefetchPending = true;
+			}
+			return;
+		}
+
+		if ((allowEnrollment && this.colorTreatmentRequested)
+			|| (!allowEnrollment && this.colorTreatment !== ActivityBarColorTreatment.Accent)) {
+			return;
+		}
+
+		this.colorTreatmentRequested = true;
+		this.colorTreatmentRequest = this.resolveColorTreatment(allowEnrollment)
+			.catch(error => {
+				this.logService.error(`Failed to resolve ${ACTIVITY_BAR_COLOR_TREATMENT}`, error);
+				if (allowEnrollment) {
+					this.colorTreatmentRequested = false;
+				}
+			})
+			.finally(() => {
+				this.colorTreatmentRequest = undefined;
+				if (this.colorTreatmentRefetchPending) {
+					this.colorTreatmentRefetchPending = false;
+					this.requestColorTreatment(false);
+				}
+			});
+	}
+
+	private async resolveColorTreatment(allowEnrollment: boolean): Promise<void> {
+		const treatment = await this.assignmentService.getTreatment<string>(ACTIVITY_BAR_COLOR_TREATMENT);
+		const nextTreatment = treatment === 'accent'
+			? ActivityBarColorTreatment.Accent
+			: ActivityBarColorTreatment.Control;
+		if (!allowEnrollment && treatment !== undefined) {
+			return;
+		}
+
+		if (this.colorTreatment !== nextTreatment) {
+			this.colorTreatment = nextTreatment;
+			if (this.element) {
+				this.updateStyles();
+			}
 		}
 	}
 

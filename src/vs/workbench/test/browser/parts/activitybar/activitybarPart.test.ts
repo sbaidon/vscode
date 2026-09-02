@@ -4,13 +4,14 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
+import { timeout } from '../../../../../base/common/async.js';
 import { DisposableStore } from '../../../../../base/common/lifecycle.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import { TestConfigurationService } from '../../../../../platform/configuration/test/common/testConfigurationService.js';
 import { TestColorTheme, TestThemeService } from '../../../../../platform/theme/test/common/testThemeService.js';
 import { TestStorageService } from '../../../common/workbenchTestServices.js';
 import { TestHostService, TestLayoutService } from '../../workbenchTestServices.js';
-import { ActivitybarPart, ActivityBarCompositeBar } from '../../../../browser/parts/activitybar/activitybarPart.js';
+import { ACTIVITY_BAR_COLOR_TREATMENT, ActivitybarPart, ActivityBarCompositeBar } from '../../../../browser/parts/activitybar/activitybarPart.js';
 import { IViewSize } from '../../../../../base/browser/ui/grid/grid.js';
 import { COMPACT_FLOATING_PANEL_OUTER_MARGIN, LayoutSettings, ModernUIDensity, Parts, Position } from '../../../../services/layout/browser/layoutService.js';
 import { mainWindow } from '../../../../../base/browser/window.js';
@@ -22,9 +23,12 @@ import { IPaneComposite } from '../../../../common/panecomposite.js';
 import { Extensions, PaneCompositeDescriptor } from '../../../../browser/panecomposite.js';
 import { IInstantiationService } from '../../../../../platform/instantiation/common/instantiation.js';
 import { ViewContainerLocation } from '../../../../common/views.js';
-import { ACTIVITY_BAR_BACKGROUND, ACTIVITY_BAR_BORDER, MODERN_ACTIVITY_BAR_BACKGROUND, MODERN_ACTIVITY_BAR_INACTIVE_BACKGROUND } from '../../../../common/theme.js';
+import { ACTIVITY_BAR_BACKGROUND, ACTIVITY_BAR_BORDER, ACTIVITY_BAR_FOREGROUND, ACTIVITY_BAR_INACTIVE_FOREGROUND, MODERN_ACTIVITY_BAR_BACKGROUND, MODERN_ACTIVITY_BAR_INACTIVE_BACKGROUND } from '../../../../common/theme.js';
 import { ActionsOrientation } from '../../../../../base/browser/ui/actionbar/actionbar.js';
 import { Dimension } from '../../../../../base/browser/dom.js';
+import { IAssignmentFilter, IWorkbenchAssignmentService } from '../../../../services/assignment/common/assignmentService.js';
+import { NullLogService } from '../../../../../platform/log/common/log.js';
+import { ColorScheme } from '../../../../../platform/theme/common/theme.js';
 
 interface ILayoutTestHarness {
 	menuBarContainer: HTMLElement | undefined;
@@ -75,6 +79,40 @@ class TestFloatingPanelsLayoutService extends TestLayoutService {
 	override getSideBarPosition(): Position { return this.sideBarPosition; }
 }
 
+class TestAssignmentService implements IWorkbenchAssignmentService {
+	declare readonly _serviceBrand: undefined;
+
+	private readonly refetchEmitter = new Emitter<void>();
+	readonly onDidRefetchAssignments = this.refetchEmitter.event;
+	readonly requestedTreatments: string[] = [];
+	treatment: string | undefined;
+	error: Error | undefined;
+	pendingTreatment: Promise<string | undefined> | undefined;
+
+	async getTreatment<T extends string | number | boolean>(name: string): Promise<T | undefined> {
+		this.requestedTreatments.push(name);
+		if (this.error) {
+			throw this.error;
+		}
+		if (this.pendingTreatment) {
+			const pendingTreatment = this.pendingTreatment;
+			this.pendingTreatment = undefined;
+			return await pendingTreatment as T | undefined;
+		}
+		return this.treatment as T | undefined;
+	}
+
+	getCurrentExperiments(): Promise<string[] | undefined> {
+		return Promise.resolve(undefined);
+	}
+
+	addTelemetryAssignmentFilter(_filter: IAssignmentFilter): void { }
+
+	fireRefetch(): void {
+		this.refetchEmitter.fire();
+	}
+}
+
 suite('ActivitybarPart', () => {
 
 	const disposables = new DisposableStore();
@@ -93,14 +131,14 @@ suite('ActivitybarPart', () => {
 		disposables.clear();
 	});
 
-	function createActivitybarPart(compact: boolean, floatingPanelsEnabled = false, sideBarPosition = Position.LEFT, colors: { [id: string]: string | undefined } = {}, modernUICompact = false, instantiationService?: IInstantiationService): { part: ActivitybarPart; configService: TestConfigurationService; layoutService: TestFloatingPanelsLayoutService; hostService: TestHostService } {
+	function createActivitybarPart(compact: boolean, floatingPanelsEnabled = false, sideBarPosition = Position.LEFT, colors: { [id: string]: string | undefined } = {}, modernUICompact = false, instantiationService?: IInstantiationService, assignmentService = new TestAssignmentService(), colorScheme = ColorScheme.DARK): { part: ActivitybarPart; configService: TestConfigurationService; layoutService: TestFloatingPanelsLayoutService; hostService: TestHostService; assignmentService: TestAssignmentService } {
 		const configService = new TestConfigurationService({
 			[LayoutSettings.ACTIVITY_BAR_COMPACT]: compact,
 			[LayoutSettings.MODERN_UI]: floatingPanelsEnabled,
 			[LayoutSettings.MODERN_UI_DENSITY]: modernUICompact ? ModernUIDensity.Compact : ModernUIDensity.Default,
 		});
 		const storageService = disposables.add(new TestStorageService());
-		const themeService = new TestThemeService(new TestColorTheme(colors));
+		const themeService = new TestThemeService(new TestColorTheme(colors, colorScheme));
 		const layoutService = new TestFloatingPanelsLayoutService();
 		const hostService = new TestHostService();
 		layoutService.floatingPanelsEnabled = floatingPanelsEnabled;
@@ -124,9 +162,11 @@ suite('ActivitybarPart', () => {
 			storageService,
 			configService,
 			hostService,
+			assignmentService,
+			new NullLogService(),
 		));
 
-		return { part, configService, layoutService, hostService };
+		return { part, configService, layoutService, hostService, assignmentService };
 	}
 
 	function fireConfigChange(configService: TestConfigurationService, key: string): void {
@@ -473,6 +513,239 @@ suite('ActivitybarPart', () => {
 			activeModernBackground: 'rgb(171, 205, 239)',
 			inactiveModernBackground: 'rgb(101, 67, 33)',
 			inactiveClassicBackground: 'rgb(18, 52, 86)',
+		});
+	});
+
+	test('requests and applies the color treatment only when first shown', async () => {
+		const assignmentService = new TestAssignmentService();
+		assignmentService.treatment = 'accent';
+		const stubCompositeBar = { create: () => { }, layout: () => { }, dispose: () => { } };
+		const { part } = createActivitybarPart(false, false, Position.LEFT, {
+			[ACTIVITY_BAR_BACKGROUND]: '#123456',
+		}, false, {
+			createInstance: () => stubCompositeBar
+		} as unknown as IInstantiationService, assignmentService);
+		const element = document.createElement('div');
+		fixture.appendChild(element);
+		part.create(element);
+
+		await timeout(0);
+		const beforeShow = {
+			background: element.style.backgroundColor,
+			requests: [...assignmentService.requestedTreatments],
+		};
+
+		part.show();
+		await timeout(0);
+		part.show();
+		await timeout(0);
+
+		assert.deepStrictEqual({
+			beforeShow,
+			afterShow: {
+				background: element.style.backgroundColor,
+				requests: assignmentService.requestedTreatments,
+			},
+		}, {
+			beforeShow: {
+				background: 'rgb(18, 52, 86)',
+				requests: [],
+			},
+			afterShow: {
+				background: 'rgb(59, 7, 100)',
+				requests: [ACTIVITY_BAR_COLOR_TREATMENT],
+			},
+		});
+	});
+
+	test('preserves theme colors for control, unknown, and high contrast treatments', async () => {
+		const render = async (treatment: string | undefined, colorScheme = ColorScheme.DARK) => {
+			const assignmentService = new TestAssignmentService();
+			assignmentService.treatment = treatment;
+			const stubCompositeBar = { create: () => { }, layout: () => { }, dispose: () => { } };
+			const { part } = createActivitybarPart(false, false, Position.LEFT, {
+				[ACTIVITY_BAR_BACKGROUND]: '#123456',
+			}, false, {
+				createInstance: () => stubCompositeBar
+			} as unknown as IInstantiationService, assignmentService, colorScheme);
+			const element = document.createElement('div');
+			fixture.appendChild(element);
+			part.create(element);
+			part.show();
+			await timeout(0);
+			return element.style.backgroundColor;
+		};
+
+		assert.deepStrictEqual({
+			control: await render('control'),
+			unknown: await render('unexpected'),
+			missing: await render(undefined),
+			highContrastTreatment: await render('accent', ColorScheme.HIGH_CONTRAST_DARK),
+		}, {
+			control: 'rgb(18, 52, 86)',
+			unknown: 'rgb(18, 52, 86)',
+			missing: 'rgb(18, 52, 86)',
+			highContrastTreatment: 'rgb(18, 52, 86)',
+		});
+	});
+
+	test('selects an accessible treatment background for light Activity Bar icons', async () => {
+		const assignmentService = new TestAssignmentService();
+		assignmentService.treatment = 'accent';
+		const stubCompositeBar = { create: () => { }, layout: () => { }, dispose: () => { } };
+		const { part } = createActivitybarPart(false, false, Position.LEFT, {
+			[ACTIVITY_BAR_BACKGROUND]: '#123456',
+			[ACTIVITY_BAR_FOREGROUND]: '#1f1f1f',
+			[ACTIVITY_BAR_INACTIVE_FOREGROUND]: '#616161',
+		}, false, {
+			createInstance: () => stubCompositeBar
+		} as unknown as IInstantiationService, assignmentService, ColorScheme.LIGHT);
+		const element = document.createElement('div');
+		fixture.appendChild(element);
+		part.create(element);
+		part.show();
+		await timeout(0);
+
+		assert.strictEqual(element.style.backgroundColor, 'rgb(233, 225, 247)');
+	});
+
+	test('keeps the treatment session-stable and removes it on assignment removal', async () => {
+		const assignmentService = new TestAssignmentService();
+		assignmentService.treatment = 'accent';
+		const stubCompositeBar = { create: () => { }, layout: () => { }, dispose: () => { } };
+		const { part, hostService } = createActivitybarPart(false, true, Position.LEFT, {
+			[MODERN_ACTIVITY_BAR_BACKGROUND]: '#abcdef',
+			[MODERN_ACTIVITY_BAR_INACTIVE_BACKGROUND]: '#654321',
+		}, false, {
+			createInstance: () => stubCompositeBar
+		} as unknown as IInstantiationService, assignmentService);
+		const element = document.createElement('div');
+		fixture.appendChild(element);
+		part.create(element);
+		part.show();
+		await timeout(0);
+
+		assignmentService.treatment = 'control';
+		assignmentService.fireRefetch();
+		await timeout(0);
+		const afterTrafficRefetch = element.style.backgroundColor;
+
+		assignmentService.treatment = undefined;
+		assignmentService.fireRefetch();
+		await timeout(0);
+		hostService.setFocus(false);
+
+		assert.deepStrictEqual({
+			afterTrafficRefetch,
+			afterRemoval: element.style.backgroundColor,
+			requests: assignmentService.requestedTreatments,
+		}, {
+			afterTrafficRefetch: 'rgb(59, 7, 100)',
+			afterRemoval: 'rgb(101, 67, 33)',
+			requests: [
+				ACTIVITY_BAR_COLOR_TREATMENT,
+				ACTIVITY_BAR_COLOR_TREATMENT,
+				ACTIVITY_BAR_COLOR_TREATMENT,
+			],
+		});
+	});
+
+	test('coalesces overlapping refetches so assignment removal is not lost', async () => {
+		const assignmentService = new TestAssignmentService();
+		assignmentService.treatment = 'accent';
+		const stubCompositeBar = { create: () => { }, layout: () => { }, dispose: () => { } };
+		const { part } = createActivitybarPart(false, false, Position.LEFT, {
+			[ACTIVITY_BAR_BACKGROUND]: '#123456',
+		}, false, {
+			createInstance: () => stubCompositeBar
+		} as unknown as IInstantiationService, assignmentService);
+		const element = document.createElement('div');
+		fixture.appendChild(element);
+		part.create(element);
+		part.show();
+		await timeout(0);
+
+		let resolvePendingTreatment: (treatment: string | undefined) => void;
+		assignmentService.pendingTreatment = new Promise(resolve => resolvePendingTreatment = resolve);
+		assignmentService.fireRefetch();
+		assignmentService.treatment = undefined;
+		assignmentService.fireRefetch();
+		resolvePendingTreatment!('control');
+		await timeout(0);
+		await timeout(0);
+
+		assert.deepStrictEqual({
+			background: element.style.backgroundColor,
+			requests: assignmentService.requestedTreatments,
+		}, {
+			background: 'rgb(18, 52, 86)',
+			requests: [
+				ACTIVITY_BAR_COLOR_TREATMENT,
+				ACTIVITY_BAR_COLOR_TREATMENT,
+				ACTIVITY_BAR_COLOR_TREATMENT,
+			],
+		});
+	});
+
+	test('preserves keyboard focus when the asynchronous treatment resolves', async () => {
+		const assignmentService = new TestAssignmentService();
+		let resolvePendingTreatment: (treatment: string | undefined) => void;
+		assignmentService.pendingTreatment = new Promise(resolve => resolvePendingTreatment = resolve);
+		const stubCompositeBar = { create: () => { }, layout: () => { }, dispose: () => { } };
+		const { part } = createActivitybarPart(false, false, Position.LEFT, {
+			[ACTIVITY_BAR_BACKGROUND]: '#123456',
+		}, false, {
+			createInstance: () => stubCompositeBar
+		} as unknown as IInstantiationService, assignmentService);
+		const element = document.createElement('div');
+		const focusedElement = document.createElement('button');
+		fixture.appendChild(element);
+		part.create(element);
+		element.appendChild(focusedElement);
+		part.show();
+		focusedElement.focus();
+
+		resolvePendingTreatment!('accent');
+		await timeout(0);
+
+		assert.deepStrictEqual({
+			background: element.style.backgroundColor,
+			activeElement: mainWindow.document.activeElement,
+		}, {
+			background: 'rgb(59, 7, 100)',
+			activeElement: focusedElement,
+		});
+	});
+
+	test('retries the initial treatment lookup after a transient failure', async () => {
+		const assignmentService = new TestAssignmentService();
+		assignmentService.error = new Error('network unavailable');
+		const stubCompositeBar = { create: () => { }, layout: () => { }, dispose: () => { } };
+		const { part } = createActivitybarPart(false, false, Position.LEFT, {
+			[ACTIVITY_BAR_BACKGROUND]: '#123456',
+		}, false, {
+			createInstance: () => stubCompositeBar
+		} as unknown as IInstantiationService, assignmentService);
+		const element = document.createElement('div');
+		fixture.appendChild(element);
+		part.create(element);
+		part.show();
+		await timeout(0);
+
+		assignmentService.error = undefined;
+		assignmentService.treatment = 'accent';
+		part.show();
+		await timeout(0);
+
+		assert.deepStrictEqual({
+			background: element.style.backgroundColor,
+			requests: assignmentService.requestedTreatments,
+		}, {
+			background: 'rgb(59, 7, 100)',
+			requests: [
+				ACTIVITY_BAR_COLOR_TREATMENT,
+				ACTIVITY_BAR_COLOR_TREATMENT,
+			],
 		});
 	});
 
